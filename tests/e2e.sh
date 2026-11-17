@@ -841,7 +841,27 @@ python3 "$(dirname "$0")/hardlink-image.py" "$IMD/hl.tar" kiri-test/hl:abs /bin/
 python3 "$(dirname "$0")/hardlink-image.py" "$IMD/hl-esc.tar" kiri-test/hl:esc /../../etc/hostname
 t load-hardlink-absolute "hello from tool" bash -c "$D load -q -i $IMD/hl.tar >/dev/null && id=\$($D create kiri-test/hl:abs) && $D cp \$id:/bin/tool-1.0 - | tar -xO; $D rm \$id >/dev/null"
 t load-hardlink-escape "escapes the layer" bash -c "$D load -q -i $IMD/hl-esc.tar >/dev/null && $D create kiri-test/hl:esc"
-$D rmi kiri-test/alp:v1 kiri-test/hl:abs kiri-test/hl:esc >/dev/null 2>&1; rm -rf "$IMD"
+# docker import: a root filesystem tarball (as docker export writes) becomes
+# an image, with --change applied and stdin, gzip and URL sources all taken.
+$D create --name imp-src alpine >/dev/null
+$D export imp-src > "$IMD/rootfs.tar"
+$D rm -f imp-src >/dev/null
+t import "sha256:" bash -c "$D import --change 'CMD [\"cat\",\"/etc/alpine-release\"]' --change 'ENV IMPORTED=1' - kiri-test/import:1 < $IMD/rootfs.tar"
+t import-runs "3." $D run --rm kiri-test/import:1
+t import-changes "IMPORTED=1" $D image inspect -f '{{json .Config.Env}}' kiri-test/import:1
+t import-gzip "3." bash -c "gzip -c $IMD/rootfs.tar | $D import - kiri-test/importgz:1 >/dev/null && $D run --rm kiri-test/importgz:1 cat /etc/alpine-release"
+IMP_NATIVE=$([ "$(uname -m)" = arm64 ] && echo arm64 || echo amd64)
+IMP_OTHER=$([ "$IMP_NATIVE" = arm64 ] && echo amd64 || echo arm64)
+t import-platform "$IMP_OTHER" bash -c "$D import --platform linux/$IMP_OTHER - kiri-test/importamd:1 < $IMD/rootfs.tar >/dev/null && $D image inspect -f '{{.Architecture}}' kiri-test/importamd:1"
+t import-bad-change "RUN is not a valid change command" bash -c "$D import --change 'RUN echo hi' - kiri-test/importbad:1 < $IMD/rootfs.tar 2>&1"
+t import-garbage "not a root filesystem tarball" bash -c "echo nope | $D import - kiri-test/importbad:1 2>&1"
+python3 -m http.server 18081 --bind 127.0.0.1 --directory "$IMD" >/dev/null 2>&1 & IMP_SRV=$!
+ready http://127.0.0.1:18081/rootfs.tar
+t import-url "3." bash -c "$D import http://127.0.0.1:18081/rootfs.tar kiri-test/importurl:1 >/dev/null && $D run --rm kiri-test/importurl:1 cat /etc/alpine-release"
+t import-url-missing "failed to GET" bash -c "$D import http://127.0.0.1:18081/nope.tar kiri-test/importurl:1 2>&1"
+kill $IMP_SRV 2>/dev/null
+$D rmi kiri-test/alp:v1 kiri-test/hl:abs kiri-test/hl:esc kiri-test/import:1 kiri-test/importgz:1 kiri-test/importamd:1 kiri-test/importurl:1 >/dev/null 2>&1
+rm -rf "$IMD"
 
 section "docker build (BuildKit in the VM)"
 BD=$(mktemp -d)

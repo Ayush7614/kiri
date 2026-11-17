@@ -148,6 +148,17 @@ fn media_type_of(path: &std::path::Path) -> io::Result<&'static str> {
     })
 }
 
+/// Checks that a stored blob is a tar: `docker import` takes a rootfs
+/// tarball, and a stray file must be refused here, not at the first
+/// container start.
+pub fn verify_layer(path: &std::path::Path) -> io::Result<()> {
+    let mut archive = tar::Archive::new(std::fs::File::open(path)?);
+    for entry in archive.entries()? {
+        entry?;
+    }
+    Ok(())
+}
+
 /// An image record from its config JSON.
 pub fn from_config(name: String, config_digest: &str, config: &Value, layers: Vec<Layer>) -> Image {
     let c = &config["config"];
@@ -231,6 +242,23 @@ mod tests {
         b.append_data(&mut h, "x", &b"x"[..]).unwrap();
         let bytes = b.into_inner().unwrap();
         assert!(load(&store, bytes.as_slice()).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn verifies_a_layer_is_a_tarball() {
+        let dir = scratch();
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_ustar();
+        h.set_size(2);
+        h.set_entry_type(tar::EntryType::Regular);
+        b.append_data(&mut h, "etc/x", &b"hi"[..]).unwrap();
+        let good = dir.join("good.tar");
+        std::fs::write(&good, b.into_inner().unwrap()).unwrap();
+        verify_layer(&good).unwrap();
+        let bad = dir.join("bad.tar");
+        std::fs::write(&bad, b"nope").unwrap();
+        assert!(verify_layer(&bad).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -2,7 +2,7 @@
 //! `rm`, `images`, `pull`, `rmi`, `version` and `info` use. Anything else
 //! answers 404 with a message saying Kiri does not support it yet.
 
-use std::io::{self, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use kiri_image::{Client, Platform, Progress, Reference};
+use kiri_image::{Client, Layer, Platform, Progress, Reference};
 use kiri_proto::Stream;
 
 use super::engine::{Container, Engine, Error, ExecConfig, RestartPolicy, Spec, Status};
@@ -52,7 +52,7 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
 
 /// Requests whose bodies can be any size: archives and image tarballs.
 fn streams_body(method: &str, path: &str) -> bool {
-    matches!((method, path), ("PUT", p) if p.starts_with("/containers/") && p.ends_with("/archive")) || (method == "POST" && (path == "/images/load" || path == "/build"))
+    matches!((method, path), ("PUT", p) if p.starts_with("/containers/") && p.ends_with("/archive")) || (method == "POST" && (path == "/images/load" || path == "/images/create" || path == "/build"))
 }
 
 pub(super) enum Next {
@@ -183,7 +183,7 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         ("GET", "/kiri/builder") => return reply(w, Ok(super::builder::settings_report(engine)), 200),
         ("POST", "/kiri/builder") => return reply(w, super::builder::set_settings(req).map(|()| super::builder::settings_report(engine)), 200),
         ("GET", "/images/json") => return reply(w, images(req, engine), 200),
-        ("POST", "/images/create") => return pull(req, engine, w),
+        ("POST", "/images/create") => return image_create(req, engine, w, r),
         ("POST", "/images/load") => return image_load(req, engine, w, r),
         ("GET", "/images/get") => {
             let names: Vec<String> = req.queries("names").map(str::to_owned).collect();
@@ -808,6 +808,121 @@ fn push(req: &Request, engine: &Engine, name: &str, w: &mut UnixStream) -> io::R
     }
     http::end(w)?;
     Ok(Next::KeepAlive)
+}
+
+/// `POST /images/create` is `docker pull` (`fromImage`) and `docker import`
+/// (`fromSrc`): the same endpoint, told apart by which name it carries.
+fn image_create(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
+    match req.query("fromSrc") {
+        Some(from) => image_import(req, engine, w, r, from),
+        None => pull(req, engine, w),
+    }
+}
+
+/// `docker import`: a rootfs tarball becomes an image with that one layer.
+/// `fromSrc` is `-` for the request body, which is what the CLI sends, or a
+/// URL the daemon fetches itself.
+fn image_import(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufReader<UnixStream>, from: &str) -> io::Result<Next> {
+    let result = if from == "-" {
+        let mut body = http::Body::new(req, r);
+        match import_layer(req, engine, from, &mut body) {
+            Ok(image) => Ok(image),
+            Err(e) => {
+                // The CLI is still sending the tarball. Closing with the
+                // body unread makes it report a broken pipe instead of this
+                // error, so read (at most 64 MiB of) what is left with the
+                // same body: it knows where the last chunk ended.
+                let mut rest = body.take(64 << 20);
+                let _ = io::copy(&mut rest, &mut io::sink());
+                Err(e)
+            }
+        }
+    } else if from.is_empty() {
+        Err(Error::BadRequest("no source given to import".into()))
+    } else {
+        match crate::tools::agent().get(from).call() {
+            Ok(resp) => import_layer(req, engine, from, resp.into_body().into_reader()),
+            Err(e) => Err(Error::BadRequest(format!("failed to GET {from}: {e}"))),
+        }
+    };
+    match result {
+        Ok(image) => {
+            http::begin_stream(w, 200, "application/json")?;
+            http::chunk(w, format!("{}\n", json!({"status": image.config_digest})).as_bytes())?;
+            http::end(w)?;
+        }
+        Err(e) => error_closing(w, e)?,
+    }
+    // A body cut short (a bad change, a failed download) is still half unread.
+    Ok(Next::Close)
+}
+
+/// The import itself: decompress the rootfs, keep it as one uncompressed
+/// layer, and write the config around it.
+fn import_layer(req: &Request, engine: &Engine, from: &str, rootfs: impl Read) -> Result<kiri_image::Image, Error> {
+    // Check the tag and the changes before taking space for the layer.
+    let repo = req.query("repo").unwrap_or_default();
+    let tag = req.query("tag").unwrap_or_default();
+    let name = if repo.is_empty() { None } else { Some(import_name(repo, tag)?) };
+    let mut cfg = json!({"config": {}});
+    for change in req.queries("changes") {
+        for line in change.lines().filter(|l| !l.trim().is_empty()) {
+            super::ops::apply_change(&mut cfg, line)?;
+        }
+    }
+
+    // Docker accepts plain and gzip-compressed tarballs here.
+    let mut rootfs = io::BufReader::with_capacity(64 << 10, rootfs);
+    let magic = {
+        let peek = rootfs.fill_buf()?;
+        peek.get(..6).map(<[u8]>::to_vec).unwrap_or_default()
+    };
+    let mut layer = engine.store.ingest()?;
+    if magic.starts_with(&[0x1f, 0x8b]) {
+        io::copy(&mut flate2::read::GzDecoder::new(rootfs), &mut layer)?;
+    } else if magic.starts_with(b"BZh") {
+        return Err(Error::BadRequest("bzip2-compressed archives are not supported yet: decompress the archive first".into()));
+    } else if magic.starts_with(b"\xfd7zXZ\x00") {
+        return Err(Error::BadRequest("xz-compressed archives are not supported yet: decompress the archive first".into()));
+    } else {
+        io::copy(&mut rootfs, &mut layer)?;
+    }
+    let (digest, size) = layer.finish()?;
+    if let Err(e) = kiri_image::archive::verify_layer(&engine.store.blob_path(&digest)?) {
+        let _ = std::fs::remove_file(engine.store.blob_path(&digest)?);
+        return Err(Error::BadRequest(format!("not a root filesystem tarball: {e}")));
+    }
+
+    let platform = req.query("platform").filter(|p| !p.is_empty()).and_then(Platform::parse).unwrap_or_else(Platform::host_linux);
+    let created = time::rfc3339(std::time::SystemTime::now());
+    let message = req.query("message").unwrap_or_default();
+    cfg["created"] = created.clone().into();
+    cfg["architecture"] = platform.architecture.clone().into();
+    cfg["os"] = platform.os.clone().into();
+    cfg["rootfs"] = json!({"type": "layers", "diff_ids": [digest.clone()]});
+    cfg["history"] = json!([{"created": created, "comment": if message.is_empty() { format!("Imported from {from}") } else { message.to_owned() }}]);
+    let bytes = serde_json::to_vec(&cfg).map_err(|e| Error::Io(io::Error::other(e)))?;
+    let mut config = engine.store.ingest()?;
+    io::Write::write_all(&mut config, &bytes)?;
+    let (config_digest, _) = config.finish()?;
+    let name = name.unwrap_or_else(|| config_digest.clone());
+    let image = kiri_image::archive::from_config(
+        name.clone(),
+        &config_digest,
+        &cfg,
+        vec![Layer { digest, size, media_type: "application/vnd.oci.image.layer.v1.tar".into() }],
+    );
+    engine.store.put_image(image.clone())?;
+    engine.emit_image("import", &config_digest, &name);
+    Ok(image)
+}
+
+/// The image name an import asked for. The CLI sends `repo=demo/thing:3`
+/// with no `tag`; other clients split them (`repo=demo/thing&tag=3`).
+fn import_name(repo: &str, tag: &str) -> Result<String, Error> {
+    let last = repo.rsplit('/').next().unwrap_or(repo);
+    let full = if tag.is_empty() || last.contains(':') { repo.to_owned() } else { format!("{repo}:{tag}") };
+    Reference::parse(&full).map(|r| r.short()).map_err(|e| Error::BadRequest(format!("invalid reference format: {e}")))
 }
 
 /// `docker pull`, streamed as JSON progress lines like dockerd sends. A
@@ -3431,6 +3546,15 @@ mod network_option_tests {
         assert_eq!(parse_link("db"), Some(("db", "db")));
         assert_eq!(parse_link("/db:/web/database"), Some(("db", "database")));
         assert_eq!(parse_link(":x"), None);
+    }
+
+    #[test]
+    fn import_names_take_both_api_shapes() {
+        assert_eq!(import_name("demo/thing", "3").unwrap(), "demo/thing:3");
+        assert_eq!(import_name("demo/thing:3", "").unwrap(), "demo/thing:3");
+        assert_eq!(import_name("localhost:5000/team/app", "1").unwrap(), "localhost:5000/team/app:1");
+        assert_eq!(import_name("alpine", "").unwrap(), "alpine:latest");
+        assert!(import_name("demo/Thing", "1").is_err());
     }
 
     #[test]
