@@ -572,7 +572,8 @@ fn image_tag(req: &Request, engine: &Engine, source: &str) -> Result<(), Error> 
 
 /// `docker load`: an image archive, streamed into the store.
 fn image_load(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
-    let loaded = kiri_image::archive::load(&engine.store, http::Body::new(req, r));
+    let platform = req.query("platform").filter(|p| !p.is_empty()).and_then(Platform::parse);
+    let loaded = kiri_image::archive::load_with_platform(&engine.store, http::Body::new(req, r), platform.as_ref());
     match loaded {
         Ok(images) => {
             http::begin_stream_with(w, 200, "application/json", http::CLOSE)?;
