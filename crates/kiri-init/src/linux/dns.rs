@@ -176,6 +176,23 @@ impl Dns {
         }
     }
 
+    /// The address container `pid`'s 127.0.0.11 server keeps its `--dns`
+    /// servers under (`set_upstream`), if it has one.
+    pub fn owner_of(&self, pid: i32) -> Option<[u8; 4]> {
+        self.servers.iter().find_map(|s| s.container.filter(|(p, _)| *p == pid).map(|(_, owner)| owner))
+    }
+
+    /// Whether the agent answers DNS at `ip` on a bridge (its gateway).
+    pub fn serves_at(&self, ip: [u8; 4]) -> bool {
+        self.servers.iter().filter(|s| s.container.is_none()).any(|s| {
+            // SAFETY: sockaddr_in is plain data; getsockname fills at most `len` bytes.
+            let mut a: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            let named = unsafe { libc::getsockname(s.sock.as_raw_fd(), (&mut a as *mut libc::sockaddr_in).cast(), &mut len) } == 0;
+            named && a.sin_addr.s_addr.to_ne_bytes() == ip
+        })
+    }
+
     /// Container `pid` is gone: its 127.0.0.11 server goes.
     pub fn drop_container(&mut self, pid: i32) {
         self.servers.retain(|s| !s.container.is_some_and(|(p, _)| p == pid));

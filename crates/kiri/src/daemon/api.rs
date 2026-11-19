@@ -50,9 +50,10 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
     Ok(())
 }
 
-/// Requests whose bodies can be any size: archives and image tarballs.
+/// Requests whose bodies can be any size: archives and image tarballs
+/// (`/images/create` is `docker import`'s, a pull sends none).
 fn streams_body(method: &str, path: &str) -> bool {
-    matches!((method, path), ("PUT", p) if p.starts_with("/containers/") && p.ends_with("/archive")) || (method == "POST" && (path == "/images/load" || path == "/build"))
+    matches!((method, path), ("PUT", p) if p.starts_with("/containers/") && p.ends_with("/archive")) || (method == "POST" && matches!(path, "/images/load" | "/images/create" | "/build"))
 }
 
 pub(super) enum Next {
@@ -183,6 +184,7 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         ("GET", "/kiri/builder") => return reply(w, Ok(super::builder::settings_report(engine)), 200),
         ("POST", "/kiri/builder") => return reply(w, super::builder::set_settings(req).map(|()| super::builder::settings_report(engine)), 200),
         ("GET", "/images/json") => return reply(w, images(req, engine), 200),
+        ("POST", "/images/create") if req.query("fromSrc").is_some_and(|s| !s.is_empty()) => return image_import(req, engine, w, r),
         ("POST", "/images/create") => return pull(req, engine, w),
         ("POST", "/images/load") => return image_load(req, engine, w, r),
         ("GET", "/images/get") => {
@@ -570,10 +572,25 @@ fn image_tag(req: &Request, engine: &Engine, source: &str) -> Result<(), Error> 
     Ok(())
 }
 
-/// `docker load`: an image archive, streamed into the store.
+/// `docker load`: an image archive, plain or gzip-compressed as Docker
+/// accepts it, streamed into the store.
 fn image_load(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
+    use std::io::Read;
+    let mut body = http::Body::new(req, r);
+    let mut head = Vec::with_capacity(6);
+    (&mut body).take(6).read_to_end(&mut head)?;
     let platform = req.query("platform").filter(|p| !p.is_empty()).and_then(Platform::parse);
-    let loaded = kiri_image::archive::load_with_platform(&engine.store, http::Body::new(req, r), platform.as_ref());
+    let loaded = upload_reader(head, &mut body).map(|archive| kiri_image::archive::load_with_platform(&engine.store, archive, platform.as_ref()));
+    let loaded = match loaded {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            // Refused from its first bytes: read the rest first, or the
+            // client, still sending, gets a broken pipe and not the reason.
+            let _ = io::copy(&mut body, &mut io::sink());
+            error_closing(w, e)?;
+            return Ok(Next::Close);
+        }
+    };
     match loaded {
         Ok(images) => {
             http::begin_stream_with(w, 200, "application/json", http::CLOSE)?;
@@ -588,6 +605,111 @@ fn image_load(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufRea
     }
     // A load may leave part of the body unread (padding after the archive's end).
     Ok(Next::Close)
+}
+
+/// `docker import`: a root filesystem tarball, the body (`fromSrc=-`) or a
+/// URL, plain or gzip, becomes a one-layer image as Docker makes it.
+fn image_import(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
+    let mut body = http::Body::new(req, r);
+    match import(req, engine, &mut body) {
+        Ok(id) => {
+            http::begin_stream_with(w, 200, "application/json", http::CLOSE)?;
+            http::chunk(w, format!("{}\n", json!({"status": id})).as_bytes())?;
+            http::end(w)?;
+        }
+        Err(e) => {
+            // The CLI is still sending the archive: read it out, or it gets
+            // a broken pipe instead of the message.
+            let _ = io::copy(&mut body, &mut io::sink());
+            error_closing(w, e)?;
+        }
+    }
+    Ok(Next::Close)
+}
+
+fn import(req: &Request, engine: &Engine, stdin: &mut dyn io::Read) -> Result<String, Error> {
+    use std::io::Read;
+    let name = import_name(req.query("repo").unwrap_or_default(), req.query("tag").unwrap_or_default())?;
+    let platform = match req.query("platform").filter(|p| !p.is_empty()) {
+        Some(p) => Platform::parse(p).ok_or_else(|| Error::BadRequest(format!("invalid platform: {p}")))?,
+        None => Platform::host_linux(),
+    };
+    let src = req.query("fromSrc").unwrap_or_default();
+    let now = time::rfc3339(std::time::SystemTime::now());
+    let comment = req.query("message").filter(|m| !m.is_empty()).map_or_else(|| format!("Imported from {src}"), str::to_owned);
+    let mut cfg = json!({
+        "architecture": platform.architecture,
+        "os": platform.os,
+        "created": now,
+        "config": {},
+        "rootfs": {"type": "layers", "diff_ids": []},
+        "history": [{"created": now, "comment": comment}],
+    });
+    // Checked before the body is read, so a bad change costs no upload.
+    for change in req.queries("changes") {
+        for line in change.lines().filter(|l| !l.trim().is_empty()) {
+            super::ops::apply_change(&mut cfg, line)?;
+        }
+    }
+    let mut body: Box<dyn Read + '_> = if src == "-" {
+        Box::new(stdin)
+    } else {
+        // Docker takes `host/path` as http.
+        let url = if src.contains("://") { src.to_owned() } else { format!("http://{src}") };
+        let resp = crate::tools::agent().get(&url).call().map_err(|e| Error::BadRequest(format!("{url}: {e}")))?;
+        Box::new(resp.into_body().into_reader())
+    };
+    let mut head = Vec::with_capacity(6);
+    (&mut body).take(6).read_to_end(&mut head)?;
+    let gzip = upload_compression(&head) == Upload::Gzip;
+    let mut tar = upload_reader(head, body)?;
+    let mut block = Vec::with_capacity(512);
+    (&mut tar).take(512).read_to_end(&mut block).map_err(|e| upload_error(gzip, e))?;
+    if !tar_header(&block) {
+        return Err(Error::BadRequest("the archive isn't a tar archive (plain or gzip)".into()));
+    }
+    // An uncompressed layer: its digest is its diff id.
+    let mut layer = engine.store.ingest()?;
+    io::copy(&mut io::Cursor::new(block).chain(tar), &mut layer).map_err(|e| upload_error(gzip, e))?;
+    let (digest, size) = layer.finish()?;
+    cfg["rootfs"]["diff_ids"] = json!([digest]);
+    let bytes = serde_json::to_vec(&cfg).map_err(|e| Error::Io(io::Error::other(e)))?;
+    let mut w = engine.store.ingest()?;
+    io::Write::write_all(&mut w, &bytes)?;
+    let (config_digest, _) = w.finish()?;
+    let layers = vec![kiri_image::Layer { digest, size, media_type: "application/vnd.oci.image.layer.v1.tar".into() }];
+    let name = name.unwrap_or_else(|| config_digest.clone());
+    engine.store.put_image(kiri_image::archive::from_config(name.clone(), &config_digest, &cfg, layers))?;
+    engine.emit_image("import", &config_digest, &name);
+    Ok(config_digest)
+}
+
+/// The name `docker import` gives its image. The CLI sends the tag in
+/// `repo` (`repo=my/rootfs:1`, no `tag`); no `repo` is an untagged image.
+fn import_name(repo: &str, tag: &str) -> Result<Option<String>, Error> {
+    if repo.is_empty() {
+        return Ok(None);
+    }
+    let name = if tag.is_empty() { repo.to_owned() } else { format!("{repo}:{tag}") };
+    if name.contains('@') {
+        return Err(Error::BadRequest(format!("cannot import digest reference: {name}")));
+    }
+    Reference::parse(&name).map(|r| Some(r.short())).map_err(|e| Error::BadRequest(format!("invalid reference format: {e}")))
+}
+
+/// Whether `block` begins a tar archive: a header whose checksum adds up,
+/// or the zero block that ends an empty archive.
+fn tar_header(block: &[u8]) -> bool {
+    if block.len() < 512 {
+        return false;
+    }
+    if block.iter().all(|&b| b == 0) {
+        return true;
+    }
+    let want = std::str::from_utf8(&block[148..156]).ok().and_then(|s| u32::from_str_radix(s.trim_matches([' ', '\0']), 8).ok());
+    // The checksum is taken with its own field as spaces.
+    let sum: u32 = block[..512].iter().enumerate().map(|(i, &b)| if (148..156).contains(&i) { 32 } else { u32::from(b) }).sum();
+    want == Some(sum)
 }
 
 /// `docker save`: the named images as one archive.
@@ -2082,6 +2204,8 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
         return Err(Error::BadRequest(format!("Unrecognised filter value for health: {bad}")));
     }
     let health = engine.health_statuses();
+    // Docker matches the image each `ancestor` value names, by ID (#442).
+    let ancestors = f.values("ancestor").map(|v| engine.ancestor_ids(v)).transpose()?;
     // A status filter lists stopped containers without --all, as Docker does.
     let all = req.flag("all") || f.values("status").is_some() || f.values("exited").is_some();
     let networks: Vec<super::network::Network> = engine.lock_net().all().to_vec();
@@ -2096,7 +2220,7 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
             && f.labels(&labels)
             && f.any("status", |v| v == state_word(c))
             && f.any("exited", |v| c.status == Status::Exited && v.parse() == Ok(c.exit_code))
-            && f.any("ancestor", |v| reference_matches(v, &c.spec.image) || c.spec.image == v || c.spec.image_id.trim_start_matches("sha256:").starts_with(v.trim_start_matches("sha256:")))
+            && ancestors.as_ref().is_none_or(|ids| ids.contains(&c.spec.image_id))
             && f.any("network", |v| net.is_some_and(|n| n.name == v || n.id.starts_with(v)))
             && f.any("volume", |v| c.spec.volumes.iter().chain(&c.spec.anon_volumes).any(|n| n == v) || c.spec.mount_info.iter().any(|m| m["Destination"] == v || m["Source"] == v))
             && f.any("health", |v| v == health.get(&c.id).map_or("none", |h| h.status.as_str()));
@@ -2317,7 +2441,7 @@ fn network_json(engine: &Engine, n: &super::network::Network, with_members: bool
 fn network_matches(f: &Filters, engine: &Engine, n: &super::network::Network) -> bool {
     let labels = if n.labels.is_object() { n.labels.clone() } else { json!({}) };
     f.name(&n.name)
-        && f.any("id", |v| n.id.starts_with(v))
+        && f.network_id(&n.id)
         && f.any("driver", |v| v == n.driver)
         && f.labels(&labels)
         && f.any("scope", |v| v == "local")
@@ -2774,8 +2898,9 @@ enum Upload {
     Unsupported(&'static str),
 }
 
-/// What an archive upload is, from its first bytes. Docker accepts tar,
-/// gzip, bzip2, xz and zstd here; anything that isn't compressed is tar.
+/// What an archive upload (`docker cp` in, `docker load`) is, from its first
+/// bytes. Docker accepts tar, gzip, bzip2, xz and zstd here; anything that
+/// isn't compressed is tar.
 fn upload_compression(head: &[u8]) -> Upload {
     match head {
         [0x1f, 0x8b, ..] => Upload::Gzip,
@@ -3084,6 +3209,38 @@ mod tests {
         assert_eq!(command(Some(vec![]), None, &ie, &ic), (vec![], ic.clone()));
     }
 
+    // #461: the CLI sends `docker import - my/rootfs:1` as `repo=my/rootfs:1`.
+    #[test]
+    fn import_names_take_the_tag_from_repo_or_tag() {
+        let name = |repo, tag| import_name(repo, tag).ok().flatten();
+        assert_eq!(name("my/rootfs:1", ""), Some("my/rootfs:1".into()));
+        assert_eq!(name("my/rootfs", "1"), Some("my/rootfs:1".into()));
+        assert_eq!(name("rootfs", ""), Some("rootfs:latest".into()));
+        assert_eq!(name("", ""), None);
+        for bad in ["My/Rootfs", "my/rootfs@sha256:0000000000000000000000000000000000000000000000000000000000000000", "a b"] {
+            assert!(matches!(import_name(bad, ""), Err(Error::BadRequest(_))), "{bad}");
+        }
+    }
+
+    #[test]
+    fn import_takes_only_tar_archives() {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_ustar();
+        h.set_path("etc/hostname").unwrap();
+        h.set_size(4);
+        h.set_cksum();
+        b.append(&h, &b"kiri"[..]).unwrap();
+        let archive = b.into_inner().unwrap();
+        assert!(tar_header(&archive[..512]));
+        // An empty archive is its end blocks.
+        assert!(tar_header(&[0; 512]));
+        let mut broken = archive[..512].to_vec();
+        broken[0] ^= 1;
+        assert!(!tar_header(&broken));
+        assert!(!tar_header(b"not a tar archive"));
+        assert!(!tar_header(&[b'x'; 512]));
+    }
+
     #[test]
     fn endpoints_alone_choose_the_primary_network() {
         let asked = std::cell::RefCell::new(Vec::new());
@@ -3158,6 +3315,63 @@ mod tests {
             assert_eq!(got, plain);
         }
         assert!(matches!(upload_reader(b"BZh91A".to_vec(), &b""[..]), Err(Error::BadRequest(m)) if m.contains("bzip2")));
+    }
+
+    /// `docker save | gzip | docker load` loads, as on Docker (issue 528):
+    /// the body goes through the same detection as `docker cp` uploads.
+    /// Each archive is sent to `POST /images/load` as the CLI sends it.
+    #[test]
+    fn image_load_takes_gzip_archives() {
+        use std::io::{Read, Write};
+        let (src, engine) = engine_in("load-gzip-src", false);
+        let put = |bytes: &[u8]| {
+            let mut w = engine.store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let config = json!({"os": "linux", "architecture": "amd64", "created": "2026-01-01T00:00:00Z", "config": {"Cmd": ["echo", "hi"]}});
+        let (cfg, _) = put(&serde_json::to_vec(&config).unwrap());
+        let (layer, size) = put(b"\x1f\x8bnot really gzip");
+        let layers = vec![kiri_image::Layer { digest: layer, size, media_type: "application/vnd.docker.image.rootfs.diff.tar.gzip".into() }];
+        let image = kiri_image::archive::from_config("demo:gz".into(), &cfg, &config, layers);
+        let mut plain = Vec::new();
+        kiri_image::archive::save(&engine.store, &[image], &mut plain).unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(src);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&plain).unwrap();
+        let gz = gz.finish().unwrap();
+
+        let load = |name: &str, body: &[u8]| {
+            let (root, engine) = engine_in(name, false);
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine)
+            });
+            write!(client, "POST /images/load?quiet=0 HTTP/1.1\r\nHost: docker\r\nContent-Type: application/x-tar\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
+            client.write_all(body).unwrap();
+            let mut answer = String::new();
+            client.read_to_string(&mut answer).unwrap();
+            served.join().unwrap().unwrap();
+            let found = engine.store.find("demo:gz").unwrap().map(|i| i.config_digest);
+            drop(engine);
+            let _ = std::fs::remove_dir_all(root);
+            (answer, found)
+        };
+        for (name, body) in [("load-gzip", &gz), ("load-plain", &plain)] {
+            let (answer, found) = load(name, body);
+            assert!(answer.starts_with("HTTP/1.1 200"), "{name}: {answer}");
+            assert!(answer.contains("Loaded image: demo:gz"), "{name}: {answer}");
+            assert_eq!(found.as_deref(), Some(cfg.as_str()), "{name}");
+        }
+        // Formats Docker takes that Kiri doesn't yet say so, not "cksum",
+        // and the client gets that answer after sending all of a big body.
+        let mut bzip2 = b"BZh91AY&SY".to_vec();
+        bzip2.resize(4 << 20, 0x5a);
+        let (answer, found) = load("load-bzip2", &bzip2);
+        assert!(answer.starts_with("HTTP/1.1 400") && answer.contains("bzip2-compressed archive isn't supported yet"), "{answer}");
+        assert_eq!(found, None);
     }
 
     /// Every damaged gzip is a 400, including the ones Docker 29 accepts

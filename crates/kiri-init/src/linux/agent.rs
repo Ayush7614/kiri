@@ -662,6 +662,22 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                                     p.run.dns_entries.push((n.bridge.to_owned(), n.ip));
                                     p.run.veths.push(host_if.clone());
                                 }
+                                // A user network's names come from the embedded
+                                // DNS, which now answers in the container: its
+                                // resolv.conf names it from here on (#449).
+                                if n.bridge != "kiri0" && !plug.no_ipv4 {
+                                    let upstream = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns[..], |l| &l.dns);
+                                    let is_kiri = |a: [u8; 4]| upstream.contains(&a) || dns.serves_at(a) || a == [1, 1, 1, 1];
+                                    match container::use_embedded_dns(id, is_kiri) {
+                                        Ok(Some(servers)) if !servers.is_empty() => {
+                                            if let Some(owner) = dns.owner_of(pid) {
+                                                dns.set_upstream(owner, servers);
+                                            }
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => eprintln!("kiri-init: {id}: resolv.conf: {e}"),
+                                    }
+                                }
                                 Msg::Ack.encode(&mut out)
                             }
                             Err(e) => Msg::Error(&format!("connect: {e}")).encode(&mut out),

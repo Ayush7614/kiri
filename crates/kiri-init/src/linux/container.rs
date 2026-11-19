@@ -625,7 +625,15 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
                 // not stand in for this container's own.
                 net.dns.drop_container(pid);
                 std::fs::File::open(format!("/proc/{pid}/ns/net"))
-                    .and_then(|ns| net.dns.serve_in(&ns, pid, spec.net.ip, spec.net.bridge))
+                    .and_then(|ns| {
+                        net.dns.serve_in(&ns, pid, spec.net.ip, spec.net.bridge)?;
+                        // User networks it joins once it runs: their names
+                        // answer from its first lookup (#449).
+                        for b in net_opts::values(spec.net.opts, net_opts::DNS_BRIDGE) {
+                            net.dns.serve_in(&ns, pid, spec.net.ip, b)?;
+                        }
+                        Ok(())
+                    })
                     .map_err(|e| kill_child(io::Error::new(e.kind(), format!("dns: {e}"))))?;
             }
             // `--dns`: names the network does not know go to these instead.
@@ -1187,6 +1195,38 @@ fn resolv_conf(spec: &RunSpec<'_>, upstream: &[[u8; 4]], embedded: Option<[u8; 4
         resolv.push_str(&format!("options {}\n", options.join(" ")));
     }
     resolv
+}
+
+/// A running container's resolv.conf once it has joined a user network
+/// (`network connect`): the embedded DNS is its only nameserver, as Docker
+/// rewrites the file (#449); search domains and options stay. Also the
+/// servers it named that `is_kiri` doesn't know as Kiri's own resolvers
+/// (`--dns`), for the embedded DNS to forward to. None when it already
+/// names the embedded DNS or names no server at all.
+pub(super) fn joined_user_network(resolv: &str, is_kiri: impl Fn([u8; 4]) -> bool) -> Option<(String, Vec<[u8; 4]>)> {
+    let named: Vec<[u8; 4]> = resolv.lines().filter_map(|l| l.strip_prefix("nameserver")).filter_map(|a| net::parse_ip(a.trim())).collect();
+    if named.is_empty() || named.contains(&super::dns::EMBEDDED) {
+        return None;
+    }
+    let mut text = format!("nameserver {}\n", net::ip_str(super::dns::EMBEDDED));
+    for line in resolv.lines().filter(|l| !l.starts_with("nameserver")) {
+        text.push_str(line);
+        text.push('\n');
+    }
+    Some((text, named.into_iter().filter(|a| !is_kiri(*a)).collect()))
+}
+
+/// Points running container `id`'s resolv.conf at the embedded DNS after it
+/// joined a user network, rewriting the file the container has bound in
+/// place, so the container sees the change. Returns its `--dns` servers.
+pub(super) fn use_embedded_dns(id: &str, is_kiri: impl Fn([u8; 4]) -> bool) -> io::Result<Option<Vec<[u8; 4]>>> {
+    valid_id(id)?;
+    let file = PathBuf::from("/run/kiri").join(id).join("resolv.conf");
+    let Some((text, servers)) = joined_user_network(&fs::read_to_string(&file)?, is_kiri) else { return Ok(None) };
+    // Truncated and written, not replaced: the container's bind mount
+    // holds this inode.
+    fs::write(&file, text)?;
+    Ok(Some(servers))
 }
 
 /// One mount, resolved before clone.
@@ -2783,6 +2823,22 @@ mod tests {
         let said = format!("kiri: cannot start container: {}\n", super::sys::one_line("user: unknown user a\nb"));
         assert_eq!(super::start_failure(&said), Some("user: unknown user a b"));
         assert_eq!(super::start_failure(""), None);
+    }
+
+    /// `network connect` to a user network (#449): the embedded DNS becomes
+    /// the only nameserver; search and options stay; `--dns` servers are
+    /// handed back for it to forward to, Kiri's own resolvers are not.
+    #[test]
+    fn joining_a_user_network_names_the_embedded_dns() {
+        let kiri = |a: [u8; 4]| a == [172, 17, 0, 1] || a == [192, 168, 64, 1];
+        let (text, fwd) = super::joined_user_network("nameserver 172.17.0.1\nsearch corp.example\noptions ndots:2\n", kiri).expect("rewritten");
+        assert_eq!(text, "nameserver 127.0.0.11\nsearch corp.example\noptions ndots:2\n");
+        assert!(fwd.is_empty(), "the bridge gateway is Kiri's own resolver");
+        let (text, fwd) = super::joined_user_network("nameserver 8.8.8.8\nnameserver 192.168.64.1\n", kiri).expect("rewritten");
+        assert_eq!(text, "nameserver 127.0.0.11\n");
+        assert_eq!(fwd, [[8, 8, 8, 8]], "--dns servers are forwarded to");
+        assert!(super::joined_user_network("nameserver 127.0.0.11\n", kiri).is_none(), "already on the embedded DNS");
+        assert!(super::joined_user_network("", kiri).is_none(), "no file to speak of");
     }
 
     #[test]

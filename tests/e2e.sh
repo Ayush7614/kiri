@@ -316,6 +316,7 @@ code none-no-internet 1 $D run --rm --network none alpine wget -qO- -T 2 http://
 t host-net "192.168.64." $D run --rm --network host alpine ip -4 addr show eth0
 t hosts-file "localhost" $D run --rm alpine cat /etc/hosts
 t add-host "1.2.3.4" $D run --rm --add-host foo:1.2.3.4 alpine getent hosts foo
+t add-host-override "10.9.8.7" $D run --rm --add-host host.docker.internal:10.9.8.7 alpine getent hosts host.docker.internal
 $D run -d --name peer nginx:alpine >/dev/null
 nginx_up peer
 PEER_IP=$($D inspect -f '{{.NetworkSettings.IPAddress}}' peer)
@@ -655,6 +656,8 @@ section "filters"
 $D run -d --name fa --label team=a --label tier=web alpine sleep 60 >/dev/null
 $D run -d --name fb --label team=b alpine sleep 60 >/dev/null
 $D run --name fx alpine sh -c 'exit 3' >/dev/null 2>&1
+# Another tag of alpine: `ancestor=alpine` is alpine:latest only (#442).
+$D run -d --name fo alpine:3.22 sleep 60 >/dev/null
 t filter-label "fa" $D ps --filter label=team=a --format '{{.Names}}'
 t filter-label-none "0" bash -c "$D ps -q --filter label=team=zzz | wc -l | tr -d ' '"
 t filter-label-and "1" bash -c "$D ps -q --filter label=team=a --filter label=tier=web | wc -l | tr -d ' '"
@@ -669,6 +672,9 @@ t filter-name-regex-anchored "0" bash -c "$D ps -q --filter 'name=^[/]?f$' | wc 
 t filter-status-exited "fx" $D ps --filter status=exited --format '{{.Names}}'
 t filter-exited-code "fx" $D ps -a --filter exited=3 --format '{{.Names}}'
 t filter-ancestor "2" bash -c "$D ps -q --filter ancestor=alpine | wc -l | tr -d ' '"
+t filter-ancestor-tag "fo" $D ps --filter ancestor=alpine:3.22 --format '{{.Names}}'
+t filter-ancestor-id "fa" bash -c "$D ps --filter ancestor=\$($D image inspect -f '{{.Id}}' alpine | cut -c8-19) --filter name=fa --format '{{.Names}}'"
+t filter-ancestor-no-glob "0" bash -c "$D ps -q --filter 'ancestor=alp*' | wc -l | tr -d ' '"
 t filter-network "2" bash -c "$D ps -q --filter network=bridge --filter label=team | wc -l | tr -d ' '"
 t filter-network-other "0" bash -c "$D ps -q --filter network=none --filter label=team | wc -l | tr -d ' '"
 t filter-id "fa" bash -c "$D ps --filter id=\$($D inspect -f '{{.Id}}' fa | cut -c1-12) --format '{{.Names}}'"
@@ -680,6 +686,10 @@ $D network create --label team=a fnet >/dev/null
 t filter-network-label "fnet" $D network ls --filter label=team=a --format '{{.Name}}'
 t filter-network-type "fnet" $D network ls --filter type=custom --format '{{.Name}}'
 t filter-network-builtin "bridge" $D network ls --filter type=builtin --format '{{.Name}}'
+# A network's id filter is a regular expression, as in Docker: k3d finds its
+# cluster network with `^/?<id>$` together with its name.
+t filter-network-id-regex "fnet" bash -c "id=\$($D network inspect -f '{{.Id}}' fnet); $D network ls --filter \"id=^/?\$id\$\" --filter 'name=^/?fnet$' --format '{{.Name}}'"
+t filter-network-id-short "fnet" bash -c "$D network ls --filter id=\$($D network inspect -f '{{.Id}}' fnet | cut -c1-12) --format '{{.Name}}'"
 $D network rm fnet >/dev/null
 $D volume create --label team=a fvol >/dev/null
 $D volume create fvol2 >/dev/null
@@ -689,7 +699,7 @@ t filter-volume-dangling "fvol2" $D volume ls --filter dangling=true --format '{
 t filter-volume-prune-all "fvol" $D volume prune -af --filter label=team=a
 t filter-volume-prune-label-only "fvol2" $D volume ls --format '{{.Name}}'
 $D volume rm fvol2 >/dev/null
-$D rm -f fa fb fx >/dev/null
+$D rm -f fa fb fx fo >/dev/null
 
 section "compose"
 # A container outside the project must not confuse Compose.
@@ -834,6 +844,7 @@ t alpine-still-there "alpine" $D images --format '{{.Repository}}'
 t load "Loaded image: kiri-test/alp:v1" $D load -i "$IMD/a.tar"
 t load-runs "3." $D run --rm kiri-test/alp:v1 cat /etc/alpine-release
 t load-stdin "Loaded image" bash -c "$D rmi kiri-test/alp:v1 >/dev/null; $D load < $IMD/a.tar"
+t load-gzip "Loaded image: kiri-test/alp:v1" bash -c "$D rmi kiri-test/alp:v1 >/dev/null; gzip -c $IMD/a.tar | $D load"
 code load-garbage 1 bash -c "echo nope | $D load"
 # A hard link's target is read from the layer's root, so a leading / is the
 # layer's, as with Docker (issue 302); `..` still can't leave the layer.
@@ -935,6 +946,16 @@ t diff-deleted "D /etc/motd" $D diff ren2
 t diff-changed "C /etc/profile" $D diff ren2
 t export "bin/busybox" bash -c "$D export ren2 | tar -t | grep -x bin/busybox"
 t export-has-change "added" bash -c "$D export ren2 | tar -t | grep -x added"
+# docker import (#461): the export back as a one-layer image, plain or gzip.
+t import "sha256:" bash -c "$D export ren2 | $D import -c 'CMD [\"cat\",\"/added\"]' -c 'ENV KIRI=1' -m 'from ren2' - kiri-test/imported:1"
+t import-runs "hi" $D run --rm kiri-test/imported:1
+t import-env "KIRI=1" $D run --rm kiri-test/imported:1 env
+t import-history "from ren2" $D history kiri-test/imported:1
+t import-gzip "hi" bash -c "$D export ren2 | gzip | $D import - kiri-test/imported:2 >/dev/null && $D run --rm kiri-test/imported:2 cat /added"
+t import-platform "linux/amd64" bash -c "$D export ren2 | $D import --platform linux/amd64 - kiri-test/imported:3 >/dev/null && $D image inspect -f '{{.Os}}/{{.Architecture}}' kiri-test/imported:3"
+t import-not-tar "isn't a tar archive" bash -c "echo nope | $D import - kiri-test/imported:4"
+t import-bad-change "not a valid change command" bash -c "$D export ren2 | $D import -c 'FROM alpine' - kiri-test/imported:4"
+$D rmi kiri-test/imported:1 kiri-test/imported:2 kiri-test/imported:3 >/dev/null 2>&1
 t commit "sha256:" $D commit -c 'CMD ["cat","/added"]' -c 'ENV KIRI=1' ren2 kiri-test/committed:1
 t commit-runs "hi" $D run --rm kiri-test/committed:1
 t commit-env "KIRI=1" $D run --rm kiri-test/committed:1 env
@@ -972,6 +993,15 @@ t connect-into-gap-addresses "2" bash -c "$D exec gaps ip -4 -o addr | grep -c '
 t disconnect-all-in-any-order "ok" bash -c "$D network disconnect nc2 gaps && $D network disconnect nc3 gaps && echo ok"
 $D rm -f gaps >/dev/null
 t network-rm-after-disconnects "all removed" bash -c "$D network rm nc1 nc2 nc3 >/dev/null 2>&1; [ -z \"\$($D network ls -q --filter name=nc1 --filter name=nc2 --filter name=nc3)\" ] && echo all removed"
+# A container on the default bridge that joins a user network resolves that
+# network's names, running or not yet started (k3d's load balancer), as on
+# Docker (#449).
+$D network create ndr >/dev/null; $D run -d --name ndr-srv --network ndr alpine sleep 300 >/dev/null
+t connect-running-resolv "127.0.0.11" bash -c "$D run -d --name ndr-a alpine sleep 300 >/dev/null && $D network connect ndr ndr-a && $D exec ndr-a cat /etc/resolv.conf"
+t connect-running-dns "Name:" $D exec ndr-a nslookup ndr-srv
+t connect-before-start-dns "Name:" bash -c "$D create --name ndr-c alpine sh -c 'nslookup ndr-srv; sleep 300' >/dev/null && $D network connect ndr ndr-c && $D start ndr-c >/dev/null && sleep 1 && $D logs ndr-c"
+t connect-dns-internet "Address" $D exec ndr-a nslookup example.com
+$D rm -f ndr-srv ndr-a ndr-c >/dev/null; $D network rm ndr >/dev/null
 
 section "events, prune, system df, search"
 t events "start" bash -c "($D events --filter container=evt --format '{{.Action}}' & p=\$!; sleep 0.5; $D run --name evt alpine true >/dev/null; sleep 0.5; kill \$p) 2>/dev/null"

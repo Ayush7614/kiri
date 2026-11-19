@@ -2233,6 +2233,11 @@ impl Engine {
         Ok(image_named(self.store.images()?, name))
     }
 
+    /// The IDs of the images that `docker ps --filter ancestor=` values name.
+    pub fn ancestor_ids(&self, values: &[String]) -> io::Result<Vec<String>> {
+        Ok(ancestor_ids(&self.store.images()?, values))
+    }
+
     /// Sends the guest every layer of these (digest, media type) it doesn't
     /// have unpacked, from the blob store.
     fn ensure_layers<'a>(&self, vm: &VmLink, layers: impl Iterator<Item = (&'a str, &'a str)>) -> io::Result<()> {
@@ -2572,6 +2577,19 @@ impl Engine {
                     dns_names.push(name);
                     dns_names.extend(spec.aliases.iter().cloned());
                     dns_names.push(hostname.clone());
+                } else {
+                    // On the default bridge and connected to a user network
+                    // before it started (k3d's load balancer): its other
+                    // networks are plugged in only once it runs, so the
+                    // embedded DNS is its resolver from the start, and answers
+                    // their names from the start, as on Docker, not after the
+                    // program has looked them up (#449). Its own name is not
+                    // registered on the bridge.
+                    let user = self.user_network_bridges(&spec);
+                    if !user.is_empty() {
+                        flags |= run_flags::DNS_GATEWAY;
+                        net6_opts.extend(user.iter().map(|b| format!("{}={b}", kiri_proto::net_opts::DNS_BRIDGE)));
+                    }
                 }
                 (n.bridge.clone(), ip, n.prefix, n.gateway)
             }
@@ -2609,12 +2627,12 @@ impl Engine {
         }
         flags |= spec.security_flags();
         // Every container can reach the Mac, as with Docker Desktop and OrbStack.
-        let mut hosts = vec![
-            format!("{}\thost.docker.internal host.kiri.internal", super::ports::HOST_ADDR),
-            format!("{}\tgateway.docker.internal", super::ports::HOST_ADDR),
-        ];
-        hosts.extend(spec.extra_hosts.iter().cloned());
+        // --add-host and links come first: /etc/hosts takes the first match,
+        // so `--add-host host.docker.internal:IP` overrides Kiri's, as on Docker.
+        let mut hosts = spec.extra_hosts.clone();
         hosts.extend(links);
+        hosts.push(format!("{}\thost.docker.internal host.kiri.internal", super::ports::HOST_ADDR));
+        hosts.push(format!("{}\tgateway.docker.internal", super::ports::HOST_ADDR));
         let mut opts = net_opts(&spec, joined.as_deref(), &domainname);
         opts.extend(net6_opts);
         let net_args = kiri_proto::Net { bridge: &bridge, ip, prefix, gateway, extra_hosts: &hosts, dns_names: &dns_names, opts: &opts };
@@ -2843,6 +2861,13 @@ impl Engine {
         attrs.insert("name".into(), net.name.clone().into());
         attrs.insert("type".into(), net.driver.clone().into());
         self.emit("network", action, &net.id, attrs, None);
+    }
+
+    /// The guest bridges of the container's other networks that are
+    /// user-defined, whose names its embedded DNS resolves.
+    fn user_network_bridges(&self, spec: &Spec) -> Vec<String> {
+        let nets = self.lock_networks();
+        spec.extra_networks.iter().filter_map(|x| nets.find(&x.name).filter(|n| n.driver == "bridge" && !n.builtin() && !n.bridge.is_empty()).map(|n| n.bridge.clone())).collect()
     }
 
     /// Fixed addresses containers not running ask for on a network: an
@@ -4308,6 +4333,20 @@ fn image_named(images: Vec<Image>, name: &str) -> Option<Image> {
     })
 }
 
+/// The image each `ancestor` filter value names, as Docker resolves it: a
+/// name (`alpine` is `alpine:latest`, not every tag of it), a reference, or
+/// an ID or ID prefix of any length, with or without `sha256:`. A value that
+/// names no image adds nothing, so it matches no container, as in Docker
+/// (#442).
+fn ancestor_ids(images: &[Image], values: &[String]) -> Vec<String> {
+    let by_id = |v: &str| {
+        let hex = v.strip_prefix("sha256:").unwrap_or(v);
+        let is_id = !hex.is_empty() && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        images.iter().find(|i| is_id && i.config_digest.strip_prefix("sha256:").is_some_and(|h| h.starts_with(hex))).cloned()
+    };
+    values.iter().filter_map(|v| image_named(images.to_vec(), v).or_else(|| by_id(v))).map(|i| i.config_digest).collect()
+}
+
 #[cfg(test)]
 mod image_lookup_tests {
     use kiri_image::{Image, RunConfig};
@@ -4366,6 +4405,25 @@ mod image_lookup_tests {
         let pulled = image("alpine:latest", None);
         assert_eq!(pulled.repo_digest(), Some(format!("alpine@{ARM64}")));
         assert!(found(&[pulled], &format!("alpine:3@{ARM64}")));
+    }
+
+    #[test]
+    fn the_ancestor_filter_names_one_image_like_docker() {
+        // #442: `alpine` is `alpine:latest`, not every tag of alpine.
+        let with_id = |name: &str, c: char| Image { config_digest: format!("sha256:{}", c.to_string().repeat(64)), ..image(name, None) };
+        let images = [with_id("alpine:latest", 'a'), with_id("alpine:3.21", 'b'), with_id("web:1", 'c')];
+        let ids = |v: &str| super::ancestor_ids(&images, &[v.to_owned()]);
+        let latest = vec![format!("sha256:{}", "a".repeat(64))];
+        for v in ["alpine", "alpine:latest", "library/alpine", "docker.io/library/alpine:latest", "aaaa", "sha256:aaaaaaaaaaaa", &latest[0]] {
+            assert_eq!(ids(v), latest, "{v}");
+        }
+        assert_eq!(ids("alpine:3.21"), vec![format!("sha256:{}", "b".repeat(64))]);
+        // Not a pattern, and nothing for a name no image has.
+        for v in ["alp*", "alpine:*", "nosuchimage", "AAAA", ""] {
+            assert!(ids(v).is_empty(), "{v}");
+        }
+        // Values OR together.
+        assert_eq!(super::ancestor_ids(&images, &["web:1".into(), "alpine:3.21".into()]).len(), 2);
     }
 }
 
